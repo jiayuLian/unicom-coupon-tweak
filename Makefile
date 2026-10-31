@@ -3,7 +3,8 @@
 # 配置通过环境变量注入, 不修改源码:
 #   make TARGET_PHONE=15629799900 TARGET_CITY=724 TARGET_PHONE_AES=
 
-CC ?= clang
+# 交叉编译必须用 clang (cc/gcc 不认 -target aarch64-apple-ios); 用 := 强制覆盖 runner 的 CC=cc 环境变量
+CC := clang
 TARGET_PHONE      ?= 15629799900
 TARGET_CITY       ?= 724
 TARGET_PHONE_AES  ?=
@@ -30,7 +31,7 @@ config_gen.h:
 	@printf '#endif\n' >> config_gen.h
 
 $(OUT): $(SRC) config_gen.h objc_runtime_min.h rt_bridge.h
-	$(CC) $(CFLAGS) -o $(OUT) $(SRC)
+	clang $(CFLAGS) -o $(OUT) $(SRC)
 
 sign: $(OUT)
 	python3 ldid_python.py $(OUT)
