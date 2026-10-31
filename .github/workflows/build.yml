@@ -16,33 +16,47 @@ on:
         required: false
         default: ''
   push:
-    branches: [ main, master ]
+    branches: [ main ]
 
 jobs:
   build:
-    runs-on: macos-14
+    # 免费 GitHub 账号私有仓库无 macOS runner; 改用 ubuntu + clang/lld 交叉编译 iOS arm64
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select Xcode (含 iphoneos SDK)
-        run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+      - name: Install clang + lld
+        run: |
+          which clang || (sudo apt-get update -qq && sudo apt-get install -y clang)
+          sudo apt-get install -y lld
+          clang --version
+          ld.lld --version 2>/dev/null || true
 
-      - name: Show SDK path (debug)
-        run: xcrun --sdk iphoneos --show-sdk-path
-
-      - name: Install ldid
-        run: brew install ldid
-
-      - name: Build dylib
+      - name: Build dylib (cross compile arm64-apple-ios)
         env:
           TARGET_PHONE: ${{ github.event.inputs.target_phone || '15629799900' }}
           TARGET_CITY: ${{ github.event.inputs.target_city || '724' }}
           TARGET_PHONE_AES: ${{ github.event.inputs.target_phone_aes || '' }}
         run: make
 
-      - name: Sign dylib
-        run: make sign
+      - name: Sign dylib (ad-hoc, best-effort)
+        run: python3 ldid_python.py couponhook.dylib || echo "sign skipped (TrollStore will re-sign on inject)"
+
+      - name: Verify artifact
+        run: |
+          file couponhook.dylib
+          python3 - <<'PY'
+          import struct
+          d=open('couponhook.dylib','rb').read()
+          ncmds=struct.unpack_from('<I',d,16)[0]
+          off=32; sig=False
+          for _ in range(ncmds):
+              cmd,cmdsize=struct.unpack_from('<II',d,off)
+              if cmd==0x1d: sig=True
+              off+=cmdsize
+          print("Mach-O arm64 dylib, LC_CODE_SIGNATURE=%s" % sig)
+          PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
