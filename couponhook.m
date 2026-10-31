@@ -6,8 +6,6 @@
 #import "config_gen.h"
 #import "objc_runtime_min.h"
 #import "rt_bridge.h"
-#include <string.h>
-#include <stdlib.h>
 
 // ---------- 配置 (来自 config_gen.h, 由 Makefile/CI 注入) ----------
 static const char *g_target_phone = TARGET_PHONE_CSTR;
