@@ -1,0 +1,51 @@
+name: Build couponhook dylib
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_phone:
+        description: '目标联通号 (券要给谁交费)'
+        required: true
+        default: '15629799900'
+      target_city:
+        description: '目标号归属地城市码 (724=湖北 110=天津 010=北京 ...)'
+        required: true
+        default: '724'
+      target_phone_aes:
+        description: '目标号 AES 密文 (frida_locate.py 算出; 留空=只改 phoneNo/cityCode)'
+        required: false
+        default: ''
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode (含 iphoneos SDK)
+        run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Show SDK path (debug)
+        run: xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build dylib
+        env:
+          TARGET_PHONE: ${{ github.event.inputs.target_phone || '15629799900' }}
+          TARGET_CITY: ${{ github.event.inputs.target_city || '724' }}
+          TARGET_PHONE_AES: ${{ github.event.inputs.target_phone_aes || '' }}
+        run: make
+
+      - name: Sign dylib
+        run: make sign
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: couponhook-dylib
+          path: couponhook.dylib
