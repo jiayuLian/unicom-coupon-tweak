@@ -12,27 +12,34 @@ jobs:
           which clang || (sudo apt-get update -qq && sudo apt-get install -y clang)
           clang --version
 
-      - name: full link test (object -> dylib)
+      - name: test pure-C link -> dylib
         run: |
           set -e
-          # 最小 OC 源: 用 objc_msgSend 占位, -undefined dynamic_lookup 让符号运行时解析
-          cat > t.m <<'EOF'
-          #import <objc/objc.h>
-          extern id objc_getClass(const char*);
-          extern SEL sel_registerName(const char*);
-          extern id objc_msgSend(id, SEL, ...);
-          __attribute__((constructor))
-          static void init(void){
-              id c = objc_getClass("NSString");
-              SEL s = sel_registerName("alloc");
-              (void)objc_msgSend(c, s);
-          }
-          int unused_func(void){ return 42; }
+          printf 'int f(void){return 7;}\n__attribute__((constructor)) void i(void){}\n' > c.c
+          clang -target aarch64-apple-ios -dynamiclib -undefined dynamic_lookup -o c.dylib c.c 2>&1 | head -40 || true
+          file c.dylib || echo "NO_DYLIB"
+
+      - name: test OC compile+link with bundled header
+        run: |
+          set -e
+          cat > hdr.h <<'EOF'
+          typedef struct objc_class *Class;
+          typedef struct objc_object *id;
+          typedef struct objc_selector *SEL;
+          typedef id (*IMP)(id, SEL, ...);
+          id objc_getClass(const char*);
+          SEL sel_registerName(const char*);
+          id objc_msgSend(id, SEL, ...);
           EOF
-          clang -target aarch64-apple-ios -c -ObjC -o t.o t.m
-          file t.o
-          # 关键: 是否能链出 Mach-O dylib
-          clang -target aarch64-apple-ios -dynamiclib -undefined dynamic_lookup -o t.dylib t.o 2>&1 | head -40
-          echo "---- result ----"
-          file t.dylib || echo "NO dylib produced"
-          ls -la t.dylib 2>/dev/null || true
+          cat > o.m <<'EOF'
+          #include "hdr.h"
+          __attribute__((constructor)) static void init(void){
+              id c = objc_getClass("NSString");
+              (void)objc_msgSend(c, sel_registerName("alloc"));
+          }
+          int f(void){return 1;}
+          EOF
+          clang -target aarch64-apple-ios -c -ObjC -I. -o o.o o.m 2>&1 | head -20
+          file o.o
+          clang -target aarch64-apple-ios -dynamiclib -undefined dynamic_lookup -o o.dylib o.o 2>&1 | head -40 || true
+          file o.dylib || echo "NO_OC_DYLIB"
