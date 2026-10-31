@@ -1,6 +1,7 @@
 #import "rt_bridge.h"
 #import "objc_runtime_min.h"
-#include <string.h>
+// 不引入 <string.h>: 交叉编译 apple target 时它会拉入宿主 glibc 头链 (bits/libc-header-start.h) 导致 fatal;
+// 本文件只用 objc_runtime_min.h 提供的 size_t, 不调用任何 libc 字符串函数。
 
 // NSString 编码常量: NSUTF8StringEncoding = 4
 #define RT_NSUTF8 4
