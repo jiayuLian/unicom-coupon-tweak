@@ -1,4 +1,4 @@
-name: probe-apple-target
+name: probe-link
 
 on:
   workflow_dispatch:
@@ -12,12 +12,27 @@ jobs:
           which clang || (sudo apt-get update -qq && sudo apt-get install -y clang)
           clang --version
 
-      - name: cross compile aarch64-apple-ios (Mach-O)
+      - name: full link test (object -> dylib)
         run: |
-          printf 'int main(){return 0;}\n' | clang -target aarch64-apple-ios -c -o /tmp/t.o -x c -
-          file /tmp/t.o
-          echo "--- objdump header check ---"
-          which llvm-objdump && llvm-objdump -h /tmp/t.o || true
-
-      - name: python3 available
-        run: python3 --version
+          set -e
+          # 最小 OC 源: 用 objc_msgSend 占位, -undefined dynamic_lookup 让符号运行时解析
+          cat > t.m <<'EOF'
+          #import <objc/objc.h>
+          extern id objc_getClass(const char*);
+          extern SEL sel_registerName(const char*);
+          extern id objc_msgSend(id, SEL, ...);
+          __attribute__((constructor))
+          static void init(void){
+              id c = objc_getClass("NSString");
+              SEL s = sel_registerName("alloc");
+              (void)objc_msgSend(c, s);
+          }
+          int unused_func(void){ return 42; }
+          EOF
+          clang -target aarch64-apple-ios -c -ObjC -o t.o t.m
+          file t.o
+          # 关键: 是否能链出 Mach-O dylib
+          clang -target aarch64-apple-ios -dynamiclib -undefined dynamic_lookup -o t.dylib t.o 2>&1 | head -40
+          echo "---- result ----"
+          file t.dylib || echo "NO dylib produced"
+          ls -la t.dylib 2>/dev/null || true
