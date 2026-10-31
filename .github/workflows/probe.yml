@@ -42,6 +42,7 @@ jobs:
 
       - name: link with lld (macho)
         run: |
-          clang -target aarch64-apple-ios -fuse-ld=lld -dynamiclib -undefined dynamic_lookup -o o.dylib o.o 2>&1 | head -50 || true
+          clang -target aarch64-apple-ios -miphoneos-version-min=14.0 -fuse-ld=lld \
+                -dynamiclib -nostdlib -undefined dynamic_lookup -o o.dylib o.o 2>&1 | head -50 || true
           file o.dylib || echo "NO_OC_DYLIB"
           ls -la o.dylib 2>/dev/null || true
