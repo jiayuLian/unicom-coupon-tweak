@@ -47,27 +47,21 @@ jobs:
           file o.dylib || echo "NO_OC_DYLIB"
           ls -la o.dylib 2>/dev/null || true
 
-      - name: test lld adhoc codesign
+      - name: inspect lld options + first segment fileoff
         run: |
-          set -e
-          clang -target aarch64-apple-ios -miphoneos-version-min=14.0 -fuse-ld=lld \
-                -dynamiclib -nostdlib -undefined dynamic_lookup -Wl,--adhoc-codesign \
-                -o o2.dylib o.o 2>&1 | head -30 || true
-          ls -la o2.dylib 2>/dev/null || echo "NO_o2"
+          echo "=== lld codesign-related options ==="
+          ld.lld --help 2>&1 | grep -iE "sign|code" | head -20
+          echo "=== first LC_SEGMENT_64 fileoff of o.dylib ==="
           python3 - <<'PY'
           import struct
-          data=open('o2.dylib','rb').read()
-          magic=struct.unpack_from('<I',data,0)[0]
-          if magic!=0xcffaedfe:
-              print("not little-endian MH_MAGIC_64, magic=%x"%magic); raise SystemExit
+          data=open('o.dylib','rb').read()
           ncmds=struct.unpack_from('<I',data,16)[0]
           off=32
-          found=False
           for i in range(ncmds):
               cmd,cmdsize=struct.unpack_from('<II',data,off)
-              if cmd==0x1d:  # LC_CODE_SIGNATURE
-                  found=True
-                  print("LC_CODE_SIGNATURE present at off=%d"%off)
+              if cmd==0x19:  # LC_SEGMENT_64
+                  segname=data[off+8:off+8+16].split(b'\x00')[0].decode()
+                  fileoff=struct.unpack_from('<Q',data,off+0x30)[0]
+                  print("segment %-16s fileoff=%d"%(segname,fileoff))
               off+=cmdsize
-          print("AD-HOC SIGN OK" if found else "NO LC_CODE_SIGNATURE")
           PY
