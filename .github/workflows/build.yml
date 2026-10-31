@@ -22,6 +22,8 @@ jobs:
   build:
     # 免费 GitHub 账号私有仓库无 macOS runner; 改用 ubuntu + clang/lld 交叉编译 iOS arm64
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 需要写权限才能创建/更新 Release
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,3 +65,18 @@ jobs:
         with:
           name: couponhook-dylib
           path: couponhook.dylib
+
+      - name: Publish Release (latest)
+        # 仅手动触发时发版，避免 push 改动也刷 Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: couponhook dylib (latest)
+          files: couponhook.dylib
+          body: |
+            TrollStore 注入中国联通 App 的 dylib，让本机交费券给目标号交费。
+            本次目标: ${{ github.event.inputs.target_phone }} / 城市码 ${{ github.event.inputs.target_city }}
+            编译: ubuntu-latest + clang/lld 交叉编译 arm64 Mach-O，自带 ldid_python 伪签名。
+            用法: TrollStore 打开中国联通 App -> 长按 -> TrollInject 选 couponhook.dylib。
+          make_latest: true
