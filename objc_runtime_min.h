@@ -8,6 +8,10 @@
 typedef unsigned long size_t;
 typedef _Bool BOOL;  // arm64 上 Obj-C BOOL 即 C99 bool
 
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
 typedef struct objc_class *Class;
 typedef struct objc_object *id;
 typedef struct objc_selector *SEL;
@@ -47,6 +51,7 @@ void free(void *);
 size_t strlen(const char *);
 int strcmp(const char *, const char *);
 char *strcpy(char *, const char *);
+char *strncpy(char *, const char *, size_t);
 char *strstr(const char *, const char *);
 char *strchr(const char *, int);
 char *strncat(char *, const char *, size_t);
