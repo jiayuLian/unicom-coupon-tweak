@@ -67,21 +67,23 @@ def build_blob(code_limit):
     nslots = (code_limit + PAGE - 1) // PAGE
 
     # CodeDirectory (version 0x20001, big-endian)
+    # 头部固定 44 字节: 9*uint32(magic..codeLimit) + 4*uint8(hashSize,hashType,platform,pageSize) + uint32(spare2)
+    CD_HEADER = 44
     cd_magic = 0xFADE0C02
     cd_version = 0x20001
     cd_flags = 0x0
-    hash_offset = 36 + len(ident)
-    ident_offset = 36
+    ident_offset = CD_HEADER
+    hash_offset = CD_HEADER + len(ident)
     n_special = 0
     n_code = nslots
     hash_size = 20      # SHA1
     hash_type = 1
-    spare1 = 0
+    spare1 = 0          # platform 字段
     page_size = 12      # log2(4096)
     spare2 = 0
     cd_length = hash_offset + n_code * hash_size
 
-    cd = struct.pack('>IIIIIIIIIIBBBBI',
+    cd = struct.pack('>IIIIIIIIIBBBBI',
                      cd_magic, cd_length, cd_version, cd_flags,
                      hash_offset, ident_offset, n_special, n_code,
                      code_limit, hash_size, hash_type, spare1, page_size, spare2)
@@ -106,8 +108,11 @@ def sign(path):
         data = bytearray(f.read())
 
     magic = struct.unpack_from('<I', data, 0)[0]
-    if magic != 0xcffaedfe:
-        raise SystemExit("not little-endian MH_MAGIC_64 (got 0x%08x)" % magic)
+    # 小端 Mach-O 64: MH_MAGIC_64 = 0xfeedfacf。0xcffaedfe 是 MH_CIGAM_64 (大端/字节序反转), 不是我们要的。
+    if magic == 0xcffaedfe:
+        raise SystemExit("file is MH_CIGAM_64 (big-endian / byte-swapped); expected MH_MAGIC_64 (got 0x%08x)" % magic)
+    if magic != 0xfeedfacf:
+        raise SystemExit("not MH_MAGIC_64 (got 0x%08x)" % magic)
 
     ncmds = struct.unpack_from('<I', data, 16)[0]
     old_sizeofcmds = struct.unpack_from('<I', data, 20)[0]
@@ -146,9 +151,10 @@ def sign(path):
 
     # 计算 code slots 的真实 hash (对 out[0:code_limit] 按页)
     sb, nslots = build_blob(code_limit)
+    sb = bytearray(sb)  # 字节需要可写, 下面要回填 hash slot
     # 填 hash: 找到 cd 中 hash 区起点 (sb_index_offset 之后)
     cd_start = 12 + 8  # superblob header + index, 在 sb 内
-    hash_area = cd_start + 36 + len(b"couponhook\x00")  # cd header(36) + ident
+    hash_area = cd_start + 44 + len(b"couponhook\x00")  # cd header(44) + ident
     for i in range(nslots):
         page = out[i * PAGE:(i + 1) * PAGE]
         if len(page) < PAGE:
