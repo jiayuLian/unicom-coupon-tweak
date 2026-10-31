@@ -46,3 +46,28 @@ jobs:
                 -dynamiclib -nostdlib -undefined dynamic_lookup -o o.dylib o.o 2>&1 | head -50 || true
           file o.dylib || echo "NO_OC_DYLIB"
           ls -la o.dylib 2>/dev/null || true
+
+      - name: test lld adhoc codesign
+        run: |
+          set -e
+          clang -target aarch64-apple-ios -miphoneos-version-min=14.0 -fuse-ld=lld \
+                -dynamiclib -nostdlib -undefined dynamic_lookup -Wl,--adhoc-codesign \
+                -o o2.dylib o.o 2>&1 | head -30 || true
+          ls -la o2.dylib 2>/dev/null || echo "NO_o2"
+          python3 - <<'PY'
+          import struct
+          data=open('o2.dylib','rb').read()
+          magic=struct.unpack_from('<I',data,0)[0]
+          if magic!=0xcffaedfe:
+              print("not little-endian MH_MAGIC_64, magic=%x"%magic); raise SystemExit
+          ncmds=struct.unpack_from('<I',data,16)[0]
+          off=32
+          found=False
+          for i in range(ncmds):
+              cmd,cmdsize=struct.unpack_from('<II',data,off)
+              if cmd==0x1d:  # LC_CODE_SIGNATURE
+                  found=True
+                  print("LC_CODE_SIGNATURE present at off=%d"%off)
+              off+=cmdsize
+          print("AD-HOC SIGN OK" if found else "NO LC_CODE_SIGNATURE")
+          PY
