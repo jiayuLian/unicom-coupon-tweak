@@ -7,19 +7,15 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: ensure clang
+      - name: ensure clang + lld
         run: |
           which clang || (sudo apt-get update -qq && sudo apt-get install -y clang)
+          sudo apt-get install -y lld
           clang --version
+          which ld.lld || echo "no ld.lld"
+          ld.lld --version 2>/dev/null || echo "ld.lld version n/a"
 
-      - name: test pure-C link -> dylib
-        run: |
-          set -e
-          printf 'int f(void){return 7;}\n__attribute__((constructor)) void i(void){}\n' > c.c
-          clang -target aarch64-apple-ios -dynamiclib -undefined dynamic_lookup -o c.dylib c.c 2>&1 | head -40 || true
-          file c.dylib || echo "NO_DYLIB"
-
-      - name: test OC compile+link with bundled header
+      - name: compile OC -> .o
         run: |
           set -e
           cat > hdr.h <<'EOF'
@@ -30,16 +26,22 @@ jobs:
           id objc_getClass(const char*);
           SEL sel_registerName(const char*);
           id objc_msgSend(id, SEL, ...);
+          void NSLog(id, ...);
           EOF
           cat > o.m <<'EOF'
           #include "hdr.h"
           __attribute__((constructor)) static void init(void){
               id c = objc_getClass("NSString");
               (void)objc_msgSend(c, sel_registerName("alloc"));
+              NSLog(objc_msgSend(c, sel_registerName("stringWithUTF8String:"), "hi"));
           }
           int f(void){return 1;}
           EOF
           clang -target aarch64-apple-ios -c -ObjC -I. -o o.o o.m 2>&1 | head -20
           file o.o
-          clang -target aarch64-apple-ios -dynamiclib -undefined dynamic_lookup -o o.dylib o.o 2>&1 | head -40 || true
+
+      - name: link with lld (macho)
+        run: |
+          clang -target aarch64-apple-ios -fuse-ld=lld -dynamiclib -undefined dynamic_lookup -o o.dylib o.o 2>&1 | head -50 || true
           file o.dylib || echo "NO_OC_DYLIB"
+          ls -la o.dylib 2>/dev/null || true
